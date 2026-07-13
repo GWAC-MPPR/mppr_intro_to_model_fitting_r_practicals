@@ -1,1 +1,1 @@
-# mppr_intro_to_fitting_practicals
+# Introduction to calibration and fitting of infectious disease models
