@@ -1,5 +1,6 @@
 ---
-title: "Bayesian inference and MCMC in R"
+title: "Fitting infectious disease models to data in R"
+subtitle: "Practical 2: Bayesian inference and Markov chain Monte Carlo"
 date: "2026-09-14"
 author: "James Mba Azam, PhD"
 format:
