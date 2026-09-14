@@ -54,6 +54,6 @@ rsconnect/
 # Quarto internals
 /.quarto/
 
-# Rendered Quarto output; regenerate with `quarto render practicals/model_fitting_practicals.qmd`
+# Rendered Quarto output; regenerate with `quarto render practicals/<name>.qmd`
 practicals/*.html
 practicals/*_files/

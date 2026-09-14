@@ -1,0 +1,890 @@
+---
+title: "Bayesian inference and MCMC in R"
+date: "2026-09-14"
+author: "James Mba Azam, PhD"
+format:
+  html:
+    theme:
+      light: flatly
+      dark: darkly
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+engine: knitr
+editor:
+  markdown:
+    wrap: 72
+---
+
+::: {.callout-tip collapse="true" icon="false"}
+### How to work with this Quarto document
+
+This document is created using **Quarto**, a powerful publishing system
+that combines text, code, and output. Here are some tips for working
+with it:
+
+#### Rendering the document:
+
+- **In RStudio/Positron**: Click the "Render" button or use
+  `Ctrl+Shift+K` (Windows/Linux) or `Cmd+Shift+K` (Mac)
+- **Command line**: Run `quarto render filename.qmd` in your terminal
+- **Alternative formats**: Change `format: html` to `format: pdf` in the
+  YAML header to render as PDF
+
+#### Running code interactively:
+
+- **Individual lines**: Place cursor on a line and press `Ctrl+Enter`
+  (Windows/Linux) or `Cmd+Enter` (Mac)
+- **Code chunks**: Click the green "play" button in the top-right corner
+  of any code chunk, or use `Ctrl+Shift+Enter` (Windows/Linux) or
+  `Cmd+Shift+Enter` (Mac)
+- **All chunks**: Use "Run All" from the Run menu or `Ctrl+Alt+R`
+  (Windows/Linux) or `Cmd+Option+R` (Mac)
+
+#### Best practices:
+
+- Run code chunks sequentially from top to bottom on your first pass
+- Experiment with parameter values by modifying the code and re-running
+  chunks
+- Save your work frequently using `Ctrl+S` (Windows/Linux) or `Cmd+S`
+  (Mac)
+:::
+
+## Learning Objectives
+
+By the end of this tutorial, you will be able to:
+
+- Explain the roles of the prior, the likelihood and the posterior in
+  Bayesian inference
+- Write down a prior for the parameters of an SIR model and check it by
+  simulating from it
+- Explain why the posterior cannot usually be computed directly, and how
+  Monte Carlo sampling gets around this
+- Implement the Metropolis algorithm from scratch and apply it first to
+  a known distribution, then to the posterior of the SIR model fitted to
+  outbreak data
+- Tune a proposal distribution and judge from trace plots, acceptance
+  rates, $\hat{R}$ and effective sample sizes whether a chain can be
+  trusted
+- Summarise a posterior sample: point estimates, credible intervals,
+  derived quantities such as $R_0$, and predictions with uncertainty
+
+## Prerequisites
+
+This tutorial follows on from the [least squares and maximum likelihood
+practical](01_model_fitting_practicals.qmd), and assumes:
+
+- Basic R programming (data manipulation, plotting, writing functions)
+- Familiarity with the SIR model and with the Poisson likelihood used in
+  the maximum likelihood section of the previous practical
+- Elementary probability (probability distributions, conditional
+  probability)
+
+**Required R packages:**
+
+```{r setup}
+# Load required packages
+library(deSolve)   # solving the SIR differential equations
+library(ggplot2)   # plotting
+library(MASS)      # mvrnorm(): multivariate normal draws for the proposal
+
+set.seed(1978)     # so that your chains match the ones in this document
+```
+
+## Introduction
+
+In the previous practical we fitted an SIR model to the 1978 influenza
+outbreak in a British boarding school by least squares and by maximum
+likelihood. Both methods returned a single *best* value for each
+parameter, with uncertainty (standard errors, profile likelihood
+intervals) obtained as a second step.
+
+Bayesian inference asks a different question. Instead of *"which
+parameter values fit best?"* it asks *"how plausible is each possible
+parameter value, given the data?"*. The answer is a whole probability
+distribution over the parameters, the **posterior distribution**, and
+every quantity we report (estimates, intervals, predictions) is read off
+that distribution.
+
+The price is computational: for a model like ours the posterior cannot
+be written down in closed form. **Markov chain Monte Carlo (MCMC)** is
+the family of algorithms that lets us draw samples from it anyway. In
+this tutorial you will build the simplest MCMC algorithm, the
+**Metropolis algorithm**, yourself, so that you understand what packages
+such as Stan, NIMBLE and `brms` are doing for you.
+
+### The Data: 1978 Influenza Outbreak
+
+We use the same data as before: daily counts of pupils confined to bed
+during a 14-day influenza outbreak in a boarding school of 763 pupils.
+
+```{r}
+# Load and prepare the data
+flu <- read.csv("./data/influenza_england_1978_school.csv")
+flu$day <- seq_len(nrow(flu))    # days 1 to 14
+flu$cases <- flu$in_bed          # pupils in bed with flu on each day
+
+ggplot(flu, aes(x = day, y = cases)) +
+  geom_line() +
+  geom_point() +
+  labs(x = "Day", y = "Number of Cases",
+       title = "Influenza Outbreak at British Boarding School, 1978",
+       subtitle = "Daily number of students in bed with flu") +
+  theme_minimal()
+```
+
+### The Model
+
+The SIR model, and the function that returns the model's prediction of
+the number of pupils in bed on days 1 to 14, are the same as in the
+maximum likelihood section of the previous practical. We start the
+epidemic at day 0 with one infectious pupil.
+
+```{r}
+# SIR model for deSolve
+sir_model <- function(t, y, params) {
+  with(as.list(c(y, params)), {
+    dS <- -beta * S * I
+    dI <- beta * S * I - gamma * I
+    dR <- gamma * I
+    list(c(dS, dI, dR))
+  })
+}
+
+init <- c(S = 762, I = 1, R = 0)   # one index case in a school of 763
+times <- 0:14                       # day 0 is the index case, data are days 1-14
+
+# Model prediction of pupils in bed on days 1 to 14
+predict_cases <- function(beta, gamma) {
+  out <- ode(y = init, times = times, func = sir_model,
+             parms = c(beta = beta, gamma = gamma))
+  out[-1, "I"]
+}
+
+# A quick check: the trajectory for beta = 0.002, gamma = 0.5
+round(predict_cases(beta = 0.002, gamma = 0.5))
+```
+
+## Bayesian inference: prior, likelihood, posterior
+
+### Bayes' rule
+
+Write $\theta$ for the parameters (here $\beta$ and $\gamma$) and $y$
+for the data. Bayes' rule says
+
+$$p(\theta \mid y) = \frac{p(y \mid \theta)\, p(\theta)}{p(y)}$$
+
+- $p(\theta)$ is the **prior**: what we believe about the parameters
+  *before* seeing the data
+- $p(y \mid \theta)$ is the **likelihood**: the probability of the data
+  for given parameter values. This is exactly the quantity we maximised
+  in the previous practical
+- $p(\theta \mid y)$ is the **posterior**: what we believe *after*
+  seeing the data
+- $p(y)$ is a normalising constant that makes the posterior integrate to
+  one. It does not depend on $\theta$
+
+Because $p(y)$ is the same for every $\theta$, the shape of the
+posterior is determined by the product of the other two:
+
+$$\text{posterior} \propto \text{likelihood} \times \text{prior}$$
+
+A useful way to think about this (Kruschke & Liddell, 2018): before the
+data, credibility is spread over the possible parameter values according
+to the prior. The data then *reallocate* credibility towards the values
+that explain them well and away from those that do not. Bayes' rule is
+the bookkeeping.
+
+### Parameter transformation
+
+As in the maximum likelihood practical, we work with the logarithms of
+the rates,
+
+$$b = \log \beta, \qquad g = \log \gamma,$$
+
+so that the parameters we sample can take any real value while $\beta$
+and $\gamma$ themselves stay positive. Throughout, `theta` is the vector
+`c(b, g)`.
+
+### The prior
+
+The prior is part of the model, so it has to be stated. We use normal
+priors on the log-rates, which is the same as lognormal priors on the
+rates themselves:
+
+- $b \sim N(\log 0.0013,\ 1)$. The centre comes from
+  $\beta = R_0 \gamma / N$ with $R_0 = 2$, $\gamma = 0.5$ and $N = 763$,
+  i.e. a fairly ordinary influenza outbreak. A standard deviation of 1
+  on the log scale means "within a factor of $e \approx 2.7$ either
+  way", which is deliberately vague.
+- $g \sim N(\log 0.5,\ 1)$: an infectious period of around two days,
+  again with a wide spread.
+
+```{r}
+log_prior <- function(theta) {
+  dnorm(theta[1], mean = log(0.0013), sd = 1, log = TRUE) +
+    dnorm(theta[2], mean = log(0.5), sd = 1, log = TRUE)
+}
+```
+
+We work with **log** densities throughout: products of many small
+probabilities become sums, and nothing underflows to zero.
+
+### Check the prior by simulating from it
+
+A prior on $\beta$ is hard to have intuition about, but an epidemic
+curve is not. So draw parameter values from the prior, run the model,
+and look at the epidemics it produces. This is a **prior predictive
+check**.
+
+```{r}
+prior_curves <- do.call(rbind, lapply(1:50, function(k) {
+  b <- rnorm(1, mean = log(0.0013), sd = 1)
+  g <- rnorm(1, mean = log(0.5), sd = 1)
+  data.frame(sim = k, day = 1:14, cases = predict_cases(exp(b), exp(g)))
+}))
+
+ggplot() +
+  geom_line(data = prior_curves, aes(x = day, y = cases, group = sim),
+            colour = "steelblue", alpha = 0.4) +
+  geom_point(data = flu, aes(x = day, y = cases), size = 2) +
+  labs(x = "Day", y = "Pupils in bed",
+       title = "50 epidemics simulated from the prior") +
+  theme_minimal()
+```
+
+The prior allows anything from no outbreak at all to the whole school in
+bed within three days. That is what a vague prior should look like: it
+covers the data comfortably without being centred on them.
+
+::: callout-tip
+### Exercise: a more informative prior
+
+Change the prior on $g$ to $N(\log 0.5,\ 0.2)$ (an infectious period of
+roughly 1.5–3 days) and re-run the prior predictive check. What changes?
+What would you need to know about influenza to justify such a prior?
+:::
+
+### The likelihood
+
+As in the previous practical, we treat each day's count as a Poisson
+draw around the model's prediction:
+
+$$y_i \sim \text{Poisson}(\lambda_i), \qquad \lambda_i = I(t_i;\ \beta, \gamma)$$
+
+```{r}
+log_likelihood <- function(theta) {
+  predicted <- predict_cases(beta = exp(theta[1]), gamma = exp(theta[2]))
+  # The ODE solver can return tiny negative numbers once the epidemic has
+  # burnt out; treat any such trajectory as impossible
+  if (any(!is.finite(predicted)) || any(predicted < 0)) return(-Inf)
+  sum(dpois(flu$cases, lambda = predicted, log = TRUE))
+}
+```
+
+### The posterior, up to a constant
+
+```{r}
+log_posterior <- function(theta) log_prior(theta) + log_likelihood(theta)
+
+# Evaluate it at a few points
+log_posterior(c(log(0.002), log(0.5)))
+log_posterior(c(log(0.0022), log(0.48)))
+log_posterior(c(log(0.001), log(0.5)))
+```
+
+Notice what we can and cannot do. We can **evaluate** the (unnormalised)
+log posterior at any $\theta$ we like: it is one call to the ODE solver.
+What we cannot do is compute the normalising constant $p(y)$, which
+would require integrating over every combination of $\beta$ and
+$\gamma$, or draw samples from the posterior directly.
+
+### Looking at the posterior on a grid
+
+With only two parameters we can get a picture of the posterior by
+evaluating it on a grid.
+
+```{r}
+beta_grid <- seq(0.0020, 0.0025, length.out = 40)
+gamma_grid <- seq(0.40, 0.56, length.out = 40)
+
+grid <- expand.grid(beta = beta_grid, gamma = gamma_grid)
+grid$log_post <- mapply(function(b, g) log_posterior(c(log(b), log(g))),
+                        grid$beta, grid$gamma)
+grid$post <- exp(grid$log_post - max(grid$log_post))   # relative to the peak
+
+ggplot(grid, aes(x = beta, y = gamma, fill = post)) +
+  geom_raster() +
+  geom_contour(aes(z = post), colour = "grey30", breaks = c(0.01, 0.1, 0.5, 0.9)) +
+  scale_fill_viridis_c(name = "relative\nposterior", option = "inferno", direction = -1) +
+  labs(x = expression(beta), y = expression(gamma),
+       title = "Posterior density on a 40 x 40 grid (1,600 model runs)") +
+  theme_minimal()
+```
+
+Two things to notice:
+
+1.  The posterior is concentrated in a small region. With 14 days of
+    data on hundreds of pupils, the likelihood dominates our vague
+    prior.
+2.  The contours are tilted: higher $\beta$ goes with higher $\gamma$.
+    The parameters are **correlated** in the posterior, because a faster
+    epidemic with a shorter infectious period produces a similar curve
+    to a slower one with a longer infectious period. We will need to
+    keep this in mind when we tune our sampler.
+
+A grid is a fine way to *look at* a two-parameter posterior. It is not a
+way to fit models: 15 values per parameter is 225 model runs for two
+parameters, 50,625 for four, and over 11 million for six. We need a
+method whose cost does not explode with the number of parameters.
+
+## Monte Carlo and the Metropolis algorithm
+
+### Learning about a distribution from samples
+
+If we had a large sample of draws from the posterior, we could estimate
+anything we wanted about it: the mean and median of each parameter, a
+95% interval from the 2.5% and 97.5% quantiles, the distribution of a
+derived quantity like $R_0 = \beta N / \gamma$ by simply computing it
+for every draw. This is the **Monte Carlo** idea, and it is how we will
+report our results.
+
+The problem is that we can only *evaluate* the posterior, up to a
+constant. **MCMC** solves exactly this problem: it generates a sequence
+(a *chain*) of parameter values in which each new value depends only on
+the previous one, arranged so that, in the long run, the chain visits
+each region of parameter space in proportion to the posterior density.
+
+### The Metropolis algorithm
+
+The Metropolis algorithm (Metropolis et al., 1953) is the simplest MCMC
+method:
+
+1.  Start at some value $\theta^{(0)}$.
+2.  **Propose** a new value by adding random noise to the current one:
+    $\theta^* = \theta + \varepsilon$, with $\varepsilon$ drawn from a
+    symmetric *proposal distribution*, e.g. $N(0, \sigma^2)$.
+3.  Compute the ratio of posterior densities
+    $$r = \frac{p(\theta^* \mid y)}{p(\theta \mid y)}.$$ The unknown
+    constant $p(y)$ appears in numerator and denominator and cancels:
+    **we never need it**.
+4.  Draw $u \sim \text{Uniform}(0, 1)$. If $u < r$, **accept**: the
+    chain moves to $\theta^*$. Otherwise **reject**: the chain stays at
+    $\theta$.
+5.  Record the current value of $\theta$ (the old value again, if the
+    proposal was rejected) and go back to step 2.
+
+Step 4 means that a proposal with *higher* posterior density is always
+accepted ($r > 1$), while a proposal with *lower* density is accepted
+with probability $r$. The chain therefore drifts towards regions of high
+posterior density but can also move downhill, which is what lets it
+explore the whole distribution rather than just climb to the mode. It
+can be shown (Chib & Greenberg, 1995) that this acceptance rule makes
+the posterior the *stationary distribution* of the chain: once the chain
+has forgotten where it started, its values are draws from the posterior.
+
+### Implementing it for one parameter
+
+Here is the whole algorithm in R. It takes any function that returns a
+log density, so we can test it on a distribution whose answer we know.
+
+```{r}
+metropolis_1d <- function(log_target, n_iter, init, proposal_sd) {
+  samples <- numeric(n_iter)
+  theta <- init
+  log_p <- log_target(theta)
+  n_accepted <- 0
+  for (i in seq_len(n_iter)) {
+    # 1. propose a move: current value plus symmetric noise
+    proposal <- theta + rnorm(1, mean = 0, sd = proposal_sd)
+    log_p_proposal <- log_target(proposal)
+    # 2. accept with probability min(1, p(proposal) / p(theta)); on the log
+    #    scale that is: accept if log(u) < log_p_proposal - log_p
+    if (log(runif(1)) < log_p_proposal - log_p) {
+      theta <- proposal
+      log_p <- log_p_proposal
+      n_accepted <- n_accepted + 1
+    }
+    # 3. record where the chain is (the old value again, if we rejected)
+    samples[i] <- theta
+  }
+  list(samples = samples, acceptance_rate = n_accepted / n_iter)
+}
+```
+
+### A test on a known target
+
+MCMC does not know anything about Bayesian inference: it samples from
+whatever distribution you give it a log density for. So let's point it
+at a $N(5, 2)$ distribution, where we know what the samples should look
+like.
+
+```{r}
+log_target <- function(theta) dnorm(theta, mean = 5, sd = 2, log = TRUE)
+
+run <- metropolis_1d(log_target, n_iter = 5000, init = 0, proposal_sd = 5)
+
+run$acceptance_rate
+mean(run$samples)   # should be close to 5
+sd(run$samples)     # should be close to 2
+```
+
+```{r}
+trace <- data.frame(iteration = seq_along(run$samples), theta = run$samples)
+
+ggplot(trace, aes(x = iteration, y = theta)) +
+  geom_line(colour = "grey30") +
+  geom_hline(yintercept = 5, colour = "tomato", linewidth = 1) +
+  labs(title = "Trace plot: where the chain has been") +
+  theme_minimal()
+
+ggplot(trace, aes(x = theta)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 40, fill = "grey80") +
+  stat_function(fun = dnorm, args = list(mean = 5, sd = 2), colour = "tomato", linewidth = 1) +
+  labs(title = "Sampled distribution against the true N(5, 2) density") +
+  theme_minimal()
+```
+
+The **trace plot** shows the chain bouncing around the true mean with a
+constant spread, and the histogram of the samples matches the true
+density. A well-behaved trace is often described as a "hairy
+caterpillar": no trend, the same width all the way along.
+
+### Tuning the proposal
+
+The proposal standard deviation is a **tuning parameter**: it is not
+part of the model, but it decides how well the sampler works.
+
+```{r}
+tuning <- do.call(rbind, lapply(c(0.2, 5, 100), function(sd) {
+  r <- metropolis_1d(log_target, n_iter = 1000, init = 5, proposal_sd = sd)
+  data.frame(proposal_sd = sprintf("sd = %g (acceptance %.0f%%)", sd, 100 * r$acceptance_rate),
+             iteration = 1:1000, theta = r$samples)
+}))
+
+ggplot(tuning, aes(x = iteration, y = theta)) +
+  geom_line(colour = "grey30") +
+  geom_hline(yintercept = 5, colour = "tomato") +
+  facet_wrap(~ proposal_sd, ncol = 1) +
+  theme_minimal()
+```
+
+- With a **narrow** proposal almost every move is accepted, but each
+  move is tiny: the chain wanders slowly and takes a long time to cover
+  the distribution.
+- With a **wide** proposal most proposals land far out in the tails and
+  are rejected: the chain sits still for long stretches.
+- In between, the chain mixes well. For random-walk proposals of this
+  kind, the theory (Roberts, Gelman & Gilks, 1997) says to aim for an
+  acceptance rate of about 44% for one parameter, falling to about 23%
+  as the number of parameters grows.
+
+::: callout-tip
+### Exercise: proposal width
+
+Try proposal standard deviations of 1, 2 and 10. Which gives the
+acceptance rate closest to 44%? Does the histogram of samples still look
+right for the badly tuned chains if you run them for long enough (say
+50,000 iterations)? What does that tell you about the difference between
+*correctness* and *efficiency*?
+:::
+
+### Burn-in
+
+The starting value is arbitrary, and the first part of the chain is
+spent travelling from it to the region of high density. Those early
+samples are not draws from the target and must be discarded: the
+**burn-in**.
+
+```{r}
+burn <- do.call(rbind, lapply(c(5, 40, 100), function(start) {
+  r <- metropolis_1d(log_target, n_iter = 500, init = start, proposal_sd = 5)
+  data.frame(start = paste("start at", start), iteration = 1:500, theta = r$samples)
+}))
+
+ggplot(burn, aes(x = iteration, y = theta)) +
+  annotate("rect", xmin = 0, xmax = 100, ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "steelblue") +
+  geom_line(colour = "grey30") +
+  geom_hline(yintercept = 5, colour = "tomato") +
+  facet_wrap(~ start) +
+  labs(title = "Chains from three starting values; shaded region = a 100-iteration burn-in") +
+  theme_minimal()
+```
+
+How much to discard is decided *after* looking at the chains. Being
+generous costs little, as long as enough samples remain. A good starting
+value (for instance the maximum likelihood estimate) shortens the
+burn-in.
+
+## Fitting the SIR model by MCMC
+
+### A sampler for several parameters
+
+For the SIR model $\theta = (b, g)$ has two components. The only change
+to the algorithm is that the proposal is now a two-dimensional normal
+draw, described by a covariance matrix rather than a single standard
+deviation. `MASS::mvrnorm()` does the drawing.
+
+```{r}
+metropolis <- function(log_target, n_iter, init, proposal_cov) {
+  samples <- matrix(NA, nrow = n_iter, ncol = length(init))
+  theta <- init
+  log_p <- log_target(theta)
+  if (!is.finite(log_p)) stop("the starting value has zero posterior density")
+  n_accepted <- 0
+  for (i in seq_len(n_iter)) {
+    proposal <- theta + MASS::mvrnorm(1, mu = rep(0, length(init)),
+                                      Sigma = proposal_cov)
+    log_p_proposal <- log_target(proposal)
+    if (log(runif(1)) < log_p_proposal - log_p) {
+      theta <- proposal
+      log_p <- log_p_proposal
+      n_accepted <- n_accepted + 1
+    }
+    samples[i, ] <- theta
+  }
+  list(samples = samples, acceptance_rate = n_accepted / n_iter)
+}
+```
+
+### A pilot run
+
+We do not yet know how wide the posterior is, so we start with a rough,
+uncorrelated proposal (standard deviation 0.1 on the log scale for each
+parameter, i.e. moves of about 10%) and a starting value at the centre
+of the prior. This run takes a few seconds: every iteration solves the
+SIR equations once.
+
+```{r}
+pilot <- metropolis(log_posterior, n_iter = 3000,
+                    init = c(log(0.0013), log(0.5)),
+                    proposal_cov = diag(c(0.1, 0.1)^2))
+pilot$acceptance_rate
+
+pilot_trace <- data.frame(iteration = 1:3000,
+                          beta = exp(pilot$samples[, 1]),
+                          gamma = exp(pilot$samples[, 2]))
+
+ggplot(pilot_trace, aes(x = iteration, y = beta)) +
+  geom_line(colour = "grey30") +
+  labs(title = "Pilot run: trace of beta") +
+  theme_minimal()
+```
+
+The chain finds the high-density region within the first few hundred
+iterations and then moves rather sluggishly: the proposal is much wider
+than the posterior, so most moves are rejected.
+
+### Tuning the proposal from the pilot
+
+The posterior is narrow and tilted, and the proposal should be shaped
+the same way. A standard recipe (Roberts & Rosenthal, 2001) is to use
+the covariance of the samples from the pilot run, scaled by $2.38^2 / d$
+where $d$ is the number of parameters. This is a simple, two-stage form
+of *adaptive* MCMC.
+
+```{r}
+tuned_cov <- 2.38^2 / 2 * cov(pilot$samples[-(1:1000), ])
+tuned_cov
+```
+
+### Several chains from dispersed starting points
+
+One chain cannot tell you about the places it has never visited. We run
+four chains from starting points spread well beyond the posterior, a
+factor of about 1.6 either side of the pilot centre, so that if they all
+end up in the same place we have some evidence that it is the right
+place. This is the slowest step: four chains of 6,000 iterations take a
+few tens of seconds.
+
+```{r}
+centre <- colMeans(pilot$samples[-(1:1000), ])
+starts <- list(centre + c(-0.5, -0.5), centre + c(0.5, -0.5),
+               centre + c(-0.5, 0.5), centre + c(0.5, 0.5))
+
+chains <- lapply(starts, function(s) {
+  metropolis(log_posterior, n_iter = 6000, init = s, proposal_cov = tuned_cov)
+})
+
+sapply(chains, function(ch) ch$acceptance_rate)
+```
+
+The acceptance rates are now in the sensible range for two parameters.
+
+### Diagnostics
+
+First the trace plots, on the natural scale and including the burn-in so
+that you can see the chains converge.
+
+```{r}
+chain_df <- do.call(rbind, lapply(seq_along(chains), function(k) {
+  data.frame(chain = factor(k), iteration = 1:6000,
+             beta = exp(chains[[k]]$samples[, 1]),
+             gamma = exp(chains[[k]]$samples[, 2]))
+}))
+chain_long <- rbind(
+  data.frame(chain_df[, c("chain", "iteration")], parameter = "beta", value = chain_df$beta),
+  data.frame(chain_df[, c("chain", "iteration")], parameter = "gamma", value = chain_df$gamma)
+)
+
+ggplot(chain_long, aes(x = iteration, y = value, colour = chain)) +
+  annotate("rect", xmin = 0, xmax = 1000, ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "steelblue") +
+  geom_line(alpha = 0.7) +
+  facet_wrap(~ parameter, scales = "free_y", ncol = 1) +
+  labs(title = "Four chains; shaded region = burn-in (first 1,000 iterations)") +
+  theme_minimal()
+```
+
+The four chains start far apart and, within the burn-in, become
+indistinguishable: the hairy caterpillar again, now in four colours. We
+discard the first 1,000 iterations of each chain and pool the rest.
+
+```{r}
+burn_in <- 1000
+posterior_samples <- do.call(rbind, lapply(chains, function(ch) ch$samples[-(1:burn_in), ]))
+colnames(posterior_samples) <- c("b", "g")
+nrow(posterior_samples)
+```
+
+Two numbers summarise what the plots show. The **Gelman–Rubin
+statistic** $\hat{R}$ compares the variance *between* chains with the
+variance *within* them; chains that have converged on the same
+distribution give $\hat{R}$ close to 1, and values above about 1.01 are
+a warning. The **effective sample size** allows for the fact that
+consecutive MCMC draws are correlated, and so carry less information
+than the same number of independent draws.
+
+```{r}
+# Gelman-Rubin R-hat for a list of chains (one parameter)
+rhat <- function(chains) {
+  n <- length(chains[[1]])
+  W <- mean(sapply(chains, var))          # mean within-chain variance
+  B <- n * var(sapply(chains, mean))      # n x variance of the chain means
+  sqrt(((n - 1) / n * W + B / n) / W)
+}
+
+# Effective sample size: n over the integrated autocorrelation time
+ess <- function(x) {
+  rho <- acf(x, lag.max = min(length(x) - 1, 500), plot = FALSE)$acf[-1]
+  k <- which(rho < 0)[1]                  # sum autocorrelations while positive
+  if (!is.na(k)) rho <- rho[seq_len(k - 1)]
+  length(x) / (1 + 2 * sum(rho))
+}
+
+c(rhat_b = rhat(lapply(chains, function(ch) ch$samples[-(1:burn_in), 1])),
+  rhat_g = rhat(lapply(chains, function(ch) ch$samples[-(1:burn_in), 2])))
+
+c(ess_b = ess(posterior_samples[, "b"]), ess_g = ess(posterior_samples[, "g"]))
+```
+
+We have 20,000 draws but only a few thousand *effective* ones, which is
+typical of random-walk Metropolis. It is still far more than we need to
+summarise two parameters.
+
+::: callout-note
+The `coda` package implements these and many other diagnostics
+(`gelman.diag()`, `effectiveSize()`, `autocorr.plot()`), and `bayesplot`
+draws the standard plots. We wrote our own here so that you can see
+exactly what they compute.
+:::
+
+### Summarising the posterior
+
+Everything we report is computed directly from the samples. Transform
+back to the natural scale, and compute the derived quantities we care
+about for every draw.
+
+```{r}
+beta_post <- exp(posterior_samples[, "b"])
+gamma_post <- exp(posterior_samples[, "g"])
+R0_post <- beta_post * 763 / gamma_post     # R0 = beta N / gamma
+period_post <- 1 / gamma_post                # infectious period in days
+
+summarise <- function(x) c(mean = mean(x), median = median(x),
+                           quantile(x, c(0.025, 0.975)))
+knitr::kable(signif(rbind(beta = summarise(beta_post),
+                          gamma = summarise(gamma_post),
+                          R0 = summarise(R0_post),
+                          infectious_period = summarise(period_post)), 3))
+```
+
+The 2.5% and 97.5% quantiles form a **95% credible interval**, which can
+be read literally: given the model, the prior and the data, there is a
+95% probability that $R_0$ lies in that range. Compare this with the
+maximum likelihood estimates from the previous practical.
+
+```{r}
+posterior_df <- data.frame(beta = beta_post, gamma = gamma_post, R0 = R0_post)
+
+ggplot(posterior_df, aes(x = R0)) +
+  geom_histogram(bins = 50, fill = "grey80") +
+  labs(x = expression(R[0]), title = "Posterior distribution of the basic reproduction number") +
+  theme_minimal()
+
+ggplot(posterior_df, aes(x = beta, y = gamma)) +
+  geom_point(alpha = 0.1, colour = "steelblue", size = 0.5) +
+  labs(x = expression(beta), y = expression(gamma),
+       title = sprintf("Joint posterior (correlation %.2f)", cor(beta_post, gamma_post))) +
+  theme_minimal()
+```
+
+### Posterior predictive check
+
+Finally, does the fitted model reproduce the data? For a few hundred
+posterior draws we simulate the trajectory, and also the Poisson counts
+around it, and plot the 95% bands against the observations.
+
+```{r}
+draws <- unname(posterior_samples[sample(nrow(posterior_samples), 500), ])
+
+trajectories <- sapply(seq_len(nrow(draws)), function(i) {
+  predict_cases(beta = exp(draws[i, 1]), gamma = exp(draws[i, 2]))
+})
+predictive <- apply(trajectories, 2, function(lambda) rpois(14, lambda))
+
+bands <- data.frame(
+  day = 1:14,
+  traj_lower = apply(trajectories, 1, quantile, 0.025),
+  traj_median = apply(trajectories, 1, quantile, 0.5),
+  traj_upper = apply(trajectories, 1, quantile, 0.975),
+  pred_lower = apply(predictive, 1, quantile, 0.025),
+  pred_upper = apply(predictive, 1, quantile, 0.975)
+)
+
+ggplot(bands, aes(x = day)) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper), fill = "tomato", alpha = 0.15) +
+  geom_ribbon(aes(ymin = traj_lower, ymax = traj_upper), fill = "tomato", alpha = 0.35) +
+  geom_line(aes(y = traj_median), colour = "tomato", linewidth = 1) +
+  geom_point(data = flu, aes(x = day, y = cases), size = 2) +
+  labs(x = "Day", y = "Pupils in bed",
+       title = "Posterior fit",
+       subtitle = "Dark band: 95% interval for the trajectory; light band: 95% interval for the counts") +
+  theme_minimal()
+```
+
+The trajectory band is narrow, because the parameters are well
+determined, and most observations fall inside the predictive band. The
+peak is slightly under-predicted and the observations scatter a little
+more than a Poisson model allows, which is a hint that a negative
+binomial observation model might be better (see the exercises).
+
+## Practical Considerations and Troubleshooting
+
+**"The starting value has zero posterior density"**
+
+- The sampler cannot start from a point where the likelihood is
+  $-\infty$, for instance parameters for which the epidemic is over
+  before the observed cases occur. Start closer to a plausible fit (the
+  least squares or maximum likelihood estimate is ideal).
+
+**Acceptance rate far from the target**
+
+- Below 10%: the proposal is too wide; shrink the covariance.
+- Above 70%: the proposal is too narrow; the chain is crawling. Enlarge
+  it.
+- Re-tune from a pilot run rather than guessing, and check the
+  autocorrelation.
+
+**Chains disagree (**$\hat{R} > 1.01$)
+
+- Run longer, discard more burn-in, and check that no chain is stuck in
+  a separate mode. If the posterior really is multimodal, a random-walk
+  proposal may never cross between modes; this is a limitation of the
+  method, not a bug in your code.
+
+**Correlated parameters**
+
+- A proposal that ignores the correlation wastes most of its moves. Use
+  the pilot covariance, or update the parameters one at a time
+  (*Metropolis-within-Gibbs*), or re-parameterise (e.g. in terms of
+  $R_0$ and the infectious period rather than $\beta$ and $\gamma$).
+
+**Slow likelihoods**
+
+- Every iteration solves the ODE. Keep the pilot run short, and check
+  timings before launching long chains.
+
+## Summary
+
+In this tutorial, we've learned how to:
+
+1.  **Set up a Bayesian model**: a prior on the parameters and a
+    likelihood for the data, and check the prior by simulating from it
+2.  **Understand why the posterior is hard to compute**, and why a grid
+    is not the answer
+3.  **Implement the Metropolis algorithm** and see it reproduce a known
+    distribution
+4.  **Tune a proposal**, choose a burn-in, and diagnose convergence with
+    trace plots, $\hat{R}$ and effective sample sizes
+5.  **Fit the SIR model to real outbreak data by MCMC** and summarise
+    the posterior: credible intervals, $R_0$, and predictions with
+    uncertainty
+
+### Key Takeaways
+
+- **The posterior is the full answer**; estimates, intervals and
+  predictions are all read off the same set of samples
+- **Metropolis is a few lines of code**; the effort goes into tuning and
+  diagnostics
+- **Priors are assumptions**: state them, and check what they imply
+- **Never trust a chain you have not checked**; diagnostics can reveal a
+  problem but never prove there is none
+- **Modern samplers** (adaptive Metropolis, Hamiltonian Monte Carlo and
+  NUTS in Stan) automate the tuning, but do the same thing underneath
+
+### References
+
+- Kruschke, J. K. and Liddell, T. M. (2018). Bayesian data analysis for
+  newcomers. *Psychonomic Bulletin & Review*, 25, 155–177.
+- van Ravenzwaaij, D., Cassey, P. and Brown, S. D. (2018). A simple
+  introduction to Markov Chain Monte–Carlo sampling. *Psychonomic
+  Bulletin & Review*, 25, 143–154.
+- Chib, S. and Greenberg, E. (1995). Understanding the
+  Metropolis–Hastings algorithm. *The American Statistician*, 49,
+  327–335.
+- Roberts, G. O., Gelman, A. and Gilks, W. R. (1997). Weak convergence
+  and optimal scaling of random walk Metropolis algorithms. *Annals of
+  Applied Probability*, 7, 110–120.
+- Roberts, G. O. and Rosenthal, J. S. (2001). Optimal scaling for
+  various Metropolis–Hastings algorithms. *Statistical Science*, 16,
+  351–367.
+- Gelman, A. and Rubin, D. B. (1992). Inference from iterative
+  simulation using multiple sequences. *Statistical Science*, 7,
+  457–472.
+
+## Exercises
+
+- Re-run the analysis with the narrower prior on $g$ from the first
+  exercise. How much do the posterior for $\gamma$ and the credible
+  interval for $R_0$ change? Why so little?
+- Replace the Poisson likelihood with a negative binomial one
+  (`dnbinom(x, mu = predicted, size = phi, log = TRUE)`) with a third
+  parameter $\phi$ (sampled on the log scale, with its own prior). Does
+  the posterior predictive band cover the data better? What happens to
+  the credible intervals for $\beta$ and $\gamma$?
+- Run the four chains with the untuned pilot proposal
+  `diag(c(0.1, 0.1)^2)` instead of `tuned_cov`. Compare the acceptance
+  rates, the trace plots and the effective sample sizes.
+- Thin the pooled sample by keeping every 10th draw. How much does the
+  effective sample size fall compared with the number of draws you threw
+  away?
+- Write a *Metropolis-within-Gibbs* version of the sampler that proposes
+  a move for $b$ and $g$ one at a time, each with its own proposal
+  standard deviation. Does it mix better or worse than the joint
+  proposal?
+- Fit an SEIR model with a fixed latent period of one day. Compare the
+  posterior for $R_0$ with the SIR result.
+
+## Acknowledgements
+
+The structure of this tutorial follows the [least squares and maximum
+likelihood practical](01_model_fitting_practicals.qmd), which is based
+on
+[materials](https://ms.mcmaster.ca/~bolker/eeid/2011_eco/EEID2011_Fitting.pdf)
+by [John M. Drake](https://daphnia.ecology.uga.edu/drakelab/). The
+explanations draw on the three papers listed above and on the course
+[Model fitting and inference for infectious disease
+dynamics](https://mfiidd.github.io/mfiidd/) by Sebastian Funk and
+colleagues.
