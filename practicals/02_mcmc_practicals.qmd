@@ -74,7 +74,7 @@ By the end of this tutorial, you will be able to:
 ## Prerequisites
 
 This tutorial follows on from the [least squares and maximum likelihood
-practical](01_model_fitting_practicals.qmd), and assumes:
+practical](01_least_squares_mle_practicals.qmd), and assumes:
 
 - Basic R programming (data manipulation, plotting, writing functions)
 - Familiarity with the SIR model and with the Poisson likelihood used in
@@ -880,7 +880,7 @@ In this tutorial, we've learned how to:
 ## Acknowledgements
 
 The structure of this tutorial follows the [least squares and maximum
-likelihood practical](01_model_fitting_practicals.qmd), which is based
+likelihood practical](01_least_squares_mle_practicals.qmd), which is based
 on
 [materials](https://ms.mcmaster.ca/~bolker/eeid/2011_eco/EEID2011_Fitting.pdf)
 by [John M. Drake](https://daphnia.ecology.uga.edu/drakelab/). The
